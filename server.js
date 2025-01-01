@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 5000;
 // Configure CORS with environment variables
 const allowedOrigins = process.env.ALLOWED_ORIGINS 
     ? process.env.ALLOWED_ORIGINS.split(',') 
-    : ['http://localhost:3000', 'https://stock-data-eight.vercel.app'];
+    : ['http://localhost:3000', 'https://st-backend-8j0f.onrender.com'];
 
 app.use(cors({
     origin: function (origin, callback) {
