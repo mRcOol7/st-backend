@@ -14,12 +14,6 @@ const HttpsProxyAgent = require('https-proxy-agent');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Add request logging middleware
-app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
-    next();
-});
-
 // Configure proxy if available
 const PROXY = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
 const axiosInstance = axios.create({
@@ -135,99 +129,59 @@ async function refreshCookies(req, res, next) {
     }
 }
 
-// Helper function to make NSE API requests
-async function makeNSERequest(url, options = {}) {
+// Helper function to make NSE API requests with retries
+async function makeNSERequest(url, options = {}, retries = 3) {
     await throttleRequest();
     
-    try {
-        const response = await axiosInstance.get(url, {
-            headers: {
-                ...headers,
-                Cookie: cookies.join('; ')
-            },
-            ...options
-        });
-        return response.data;
-    } catch (error) {
-        if (error.response && error.response.status === 403) {
-            // Clear cookies on forbidden response
-            cookies = '';
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const response = await axiosInstance.get(url, {
+                headers: {
+                    ...headers,
+                    Cookie: cookies.join('; ')
+                },
+                timeout: 15000, // 15 second timeout
+                ...options
+            });
+            return response.data;
+        } catch (error) {
+            if (error.response && error.response.status === 403) {
+                // Clear cookies on forbidden response
+                cookies = '';
+                // Get new cookies immediately
+                await getCookies();
+            }
+            
+            if (attempt === retries) {
+                // If this was our last attempt, throw the error
+                if (error.code === 'ECONNABORTED') {
+                    throw new Error('Request timed out. Please try again.');
+                }
+                throw error;
+            }
+            
+            // Calculate delay using exponential backoff
+            const delay = Math.min(1000 * Math.pow(2, attempt), 10000);
+            console.log(`Request attempt ${attempt} failed. Retrying in ${delay}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
-        throw error;
     }
 }
 
 app.use(refreshCookies);
 
-// Dummy data for testing
-const dummyNiftyData = {
-    "name": "NIFTY 50",
-    "lastPrice": 21500.45,
-    "change": 123.45,
-    "pChange": 0.58,
-    "timestamp": new Date().toISOString()
-};
-
-const dummyStockData = {
-    "symbol": "TATAMOTORS",
-    "lastPrice": 750.25,
-    "change": 15.30,
-    "pChange": 2.08,
-    "volume": 12345678
-};
-
-// Test endpoint to verify server is responding
-app.get('/api/test', (req, res) => {
-    res.json({ 
-        status: 'success',
-        message: 'Server is running',
-        timestamp: new Date().toISOString()
-    });
-});
-
-// Dummy endpoint for testing without NSE API
-app.get('/api/dummy/nifty50', (req, res) => {
-    res.json(dummyNiftyData);
-});
-
-app.get('/api/dummy/stock/:symbol', (req, res) => {
-    res.json({
-        ...dummyStockData,
-        symbol: req.params.symbol
-    });
-});
-
 // Proxy endpoint for NIFTY 50 data
 app.get('/api/nifty50', async (req, res) => {
-    // First try the dummy endpoint to test connection
     try {
-        console.log('Testing connection with dummy data first...');
-        const dummyResponse = await axiosInstance.get(`http://localhost:${PORT}/api/dummy/nifty50`);
-        console.log('Dummy endpoint working, proceeding with NSE API...');
-        
         const data = await makeNSERequest(
             'https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050'
         );
         res.json(data);
     } catch (error) {
-        console.error('Error details:', {
-            message: error.message,
-            code: error.code,
-            status: error.response?.status,
-            isAxiosError: error.isAxiosError
-        });
-        
-        if (error.code === 'ECONNREFUSED' && error.message.includes('localhost')) {
-            // If local test failed, return dummy data
-            console.log('Local test failed, returning dummy data');
-            return res.json(dummyNiftyData);
-        }
-        
+        console.error('Error fetching NIFTY 50 data:', error.message);
         res.status(503).json({
             error: 'Service temporarily unavailable',
-            message: 'Unable to fetch NIFTY 50 data. Please try again later.',
-            errorCode: error.code,
-            errorType: error.name
+            message: 'Unable to fetch NIFTY 50 data. Please try again later.'
         });
     }
 });
@@ -235,11 +189,6 @@ app.get('/api/nifty50', async (req, res) => {
 // Proxy endpoint for individual stock data
 app.get('/api/stock/:symbol', async (req, res) => {
     try {
-        // First try dummy data
-        console.log('Testing connection with dummy data first...');
-        const dummyResponse = await axiosInstance.get(`http://localhost:${PORT}/api/dummy/stock/${req.params.symbol}`);
-        console.log('Dummy endpoint working, proceeding with NSE API...');
-        
         const [quoteData, tradeInfo] = await Promise.all([
             makeNSERequest(
                 `https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(req.params.symbol)}`
@@ -254,38 +203,12 @@ app.get('/api/stock/:symbol', async (req, res) => {
             tradeInfo: tradeInfo
         });
     } catch (error) {
-        console.error('Error details:', {
-            message: error.message,
-            code: error.code,
-            status: error.response?.status,
-            isAxiosError: error.isAxiosError
-        });
-        
-        if (error.code === 'ECONNREFUSED' && error.message.includes('localhost')) {
-            // If local test failed, return dummy data
-            console.log('Local test failed, returning dummy data');
-            return res.json({
-                quote: { ...dummyStockData, symbol: req.params.symbol },
-                tradeInfo: { symbol: req.params.symbol, totalTradedVolume: 12345678 }
-            });
-        }
-        
+        console.error('Error fetching stock data:', error.message);
         res.status(503).json({
             error: 'Service temporarily unavailable',
-            message: 'Unable to fetch stock data. Please try again later.',
-            errorCode: error.code,
-            errorType: error.name
+            message: 'Unable to fetch stock data. Please try again later.'
         });
     }
-});
-
-// Add a health check endpoint
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime()
-    });
 });
 
 // Test endpoint for Vercel deployment
@@ -294,13 +217,5 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-    console.log('Environment:', process.env.NODE_ENV);
-    console.log('Available endpoints:');
-    console.log('- GET /health');
-    console.log('- GET /api/test');
-    console.log('- GET /api/dummy/nifty50');
-    console.log('- GET /api/dummy/stock/:symbol');
-    console.log('- GET /api/nifty50');
-    console.log('- GET /api/stock/:symbol');
+    console.log(`Proxy server running on port ${PORT}`);
 });
