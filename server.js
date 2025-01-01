@@ -8,9 +8,26 @@ try {
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const https = require('https');
+const HttpsProxyAgent = require('https-proxy-agent');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Configure proxy if available
+const PROXY = process.env.HTTP_PROXY || process.env.HTTPS_PROXY;
+const axiosInstance = axios.create({
+    timeout: 30000, // 30 seconds timeout
+    httpsAgent: new https.Agent({ 
+        rejectUnauthorized: false,
+        keepAlive: true,
+        timeout: 30000
+    }),
+    ...(PROXY && {
+        proxy: false,
+        httpsAgent: new HttpsProxyAgent(PROXY)
+    })
+});
 
 // Configure CORS with environment variables
 const allowedOrigins = process.env.ALLOWED_ORIGINS 
@@ -35,7 +52,7 @@ app.use(cors({
 // Store cookies and last request time
 let cookies = '';
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 1000; // Minimum 1 second between requests
+const MIN_REQUEST_INTERVAL = 2000; // Increase to 2 seconds between requests
 
 // Required headers for NSE API
 const headers = {
@@ -44,7 +61,9 @@ const headers = {
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept-Encoding': 'gzip, deflate, br',
     'Referer': 'https://www.nseindia.com',
-    'Connection': 'keep-alive'
+    'Connection': 'keep-alive',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
 };
 
 // Function to delay execution
@@ -61,28 +80,34 @@ async function throttleRequest() {
 }
 
 // Function to get cookies with retry logic
-async function getCookies(retries = 3, backoff = 1000) {
+async function getCookies(retries = 5, backoff = 2000) {
     for (let i = 0; i < retries; i++) {
         try {
             await throttleRequest();
             
-            const response = await axios.get('https://www.nseindia.com', {
+            const response = await axiosInstance.get('https://www.nseindia.com', {
                 headers: headers,
-                timeout: 5000,
                 maxRedirects: 5,
                 validateStatus: function (status) {
-                    return status >= 200 && status < 303; // Accept only success and redirect status codes
+                    return status >= 200 && status < 303;
                 }
             });
 
             if (response.headers['set-cookie']) {
                 return response.headers['set-cookie'];
             }
+            
+            // If we got a response but no cookies, wait before retrying
+            await delay(backoff);
             throw new Error('No cookies received');
         } catch (error) {
             console.error(`Attempt ${i + 1} failed:`, error.message);
             if (i === retries - 1) throw error;
-            await delay(backoff * Math.pow(2, i)); // Exponential backoff
+            
+            // Longer backoff for deployment environment
+            const waitTime = backoff * Math.pow(2, i);
+            console.log(`Waiting ${waitTime}ms before next attempt...`);
+            await delay(waitTime);
         }
     }
 }
@@ -96,12 +121,33 @@ async function refreshCookies(req, res, next) {
         next();
     } catch (error) {
         console.error('Error refreshing cookies:', error);
-        // Clear cookies on error to force a refresh on next attempt
         cookies = '';
         res.status(503).json({ 
             error: 'Service temporarily unavailable',
-            message: 'Failed to connect to NSE. Please try again in a few moments.'
+            message: 'NSE services are currently unavailable. Please try again in a few moments.'
         });
+    }
+}
+
+// Helper function to make NSE API requests
+async function makeNSERequest(url, options = {}) {
+    await throttleRequest();
+    
+    try {
+        const response = await axiosInstance.get(url, {
+            headers: {
+                ...headers,
+                Cookie: cookies.join('; ')
+            },
+            ...options
+        });
+        return response.data;
+    } catch (error) {
+        if (error.response && error.response.status === 403) {
+            // Clear cookies on forbidden response
+            cookies = '';
+        }
+        throw error;
     }
 }
 
@@ -110,72 +156,41 @@ app.use(refreshCookies);
 // Proxy endpoint for NIFTY 50 data
 app.get('/api/nifty50', async (req, res) => {
     try {
-        await throttleRequest();
-        
-        const response = await axios.get(
-            'https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050',
-            {
-                headers: {
-                    ...headers,
-                    'Cookie': cookies.join('; ')
-                }
-            }
+        const data = await makeNSERequest(
+            'https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050'
         );
-        console.log('NSE API Response:', response.data);
-        res.json(response.data);
+        res.json(data);
     } catch (error) {
-        console.error('Error fetching data:', error);
-        // If cookie expired, clear it so it will be refreshed
-        if (error.response && error.response.status === 403) {
-            cookies = '';
-        }
-        res.status(500).json({ error: 'Failed to fetch data from NSE' });
+        console.error('Error fetching NIFTY 50 data:', error.message);
+        res.status(503).json({
+            error: 'Service temporarily unavailable',
+            message: 'Unable to fetch NIFTY 50 data. Please try again later.'
+        });
     }
 });
 
-// Proxy endpoint for stock details
+// Proxy endpoint for individual stock data
 app.get('/api/stock/:symbol', async (req, res) => {
     try {
-        // First get the quote data
-        await throttleRequest();
+        const [quoteData, tradeInfo] = await Promise.all([
+            makeNSERequest(
+                `https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(req.params.symbol)}`
+            ),
+            makeNSERequest(
+                `https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(req.params.symbol)}&section=trade_info`
+            )
+        ]);
         
-        const quoteResponse = await axios.get(
-            `https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(req.params.symbol)}`,
-            {
-                headers: {
-                    ...headers,
-                    'Cookie': cookies.join('; ')
-                }
-            }
-        );
-
-        // Then get the trade info data which has more detailed volume information
-        await throttleRequest();
-        
-        const tradeInfoResponse = await axios.get(
-            `https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(req.params.symbol)}&section=trade_info`,
-            {
-                headers: {
-                    ...headers,
-                    'Cookie': cookies.join('; ')
-                }
-            }
-        );
-
-        // Combine the data
-        const combinedData = {
-            ...quoteResponse.data,
-            tradeInfo: tradeInfoResponse.data
-        };
-
-        res.json(combinedData);
+        res.json({
+            quote: quoteData,
+            tradeInfo: tradeInfo
+        });
     } catch (error) {
-        console.error('Error fetching stock details:', error);
-        // If cookie expired, clear it so it will be refreshed
-        if (error.response && error.response.status === 403) {
-            cookies = '';
-        }
-        res.status(500).json({ error: 'Failed to fetch stock details' });
+        console.error('Error fetching stock data:', error.message);
+        res.status(503).json({
+            error: 'Service temporarily unavailable',
+            message: 'Unable to fetch stock data. Please try again later.'
+        });
     }
 });
 
